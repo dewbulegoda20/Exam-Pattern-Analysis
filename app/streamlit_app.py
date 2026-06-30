@@ -32,6 +32,7 @@ from src.pipeline import (
     run_analysis_pipeline,
 )
 from src.preprocessing.pdf_extractor import PDFExtractor
+from src.preprocessing.text_cleaner import fix_spacing
 from src.utils import PROCESSED_DIR, RAW_DIR, setup_logging
 
 logger = setup_logging("streamlit_app")
@@ -99,6 +100,44 @@ THEME_CSS = """
     [data-testid="stDataFrame"] th {
         font-weight: 600 !important;
     }
+
+    /* Cross-paper duplicate pair cards */
+    .dup-card {
+        border: 1px solid #c5d5f5;
+        border-radius: 10px;
+        padding: 14px 18px;
+        margin-bottom: 14px;
+        background-color: #f7f9ff;
+    }
+    html[data-theme="dark"] .dup-card,
+    [data-testid="stAppViewContainer"][class*="dark"] .dup-card {
+        background-color: #1a2340;
+        border-color: #2e4a8a;
+    }
+    .dup-score {
+        font-size: 0.78rem;
+        font-weight: 700;
+        letter-spacing: 0.03em;
+        margin-bottom: 10px;
+    }
+    .dup-score.exact  { color: #d62728; }
+    .dup-score.high   { color: #e07b00; }
+    .dup-score.medium { color: #1f77b4; }
+    .dup-paper-label {
+        font-size: 0.82rem;
+        font-weight: 600;
+        margin-bottom: 4px;
+        color: #4f8ef7;
+    }
+    .dup-q {
+        font-size: 0.93rem;
+        line-height: 1.5;
+    }
+    .dup-divider {
+        border: none;
+        border-top: 1px dashed rgba(100,116,139,0.3);
+        margin: 6px 0 10px 0;
+    }
 </style>
 """
 st.markdown(THEME_CSS, unsafe_allow_html=True)
@@ -116,6 +155,9 @@ def init_session_state() -> None:
         "prompt_strategy": "context_aware",
         "api_key": "",
         "selected_subject_filter": "All Subjects",
+        "silhouette_score": 0.0,
+        "gen_topic_for_bleu": "",
+        "gen_subject_for_bleu": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -207,6 +249,7 @@ def render_sidebar() -> None:
             "Question Predictions",
             "Similarity Search",
             "Analytics Dashboard",
+            "Evaluation Metrics",
         ],
     )
 
@@ -277,20 +320,25 @@ def page_upload_process() -> None:
                 progress = st.progress(0)
                 processed_frames: list[pd.DataFrame] = []
                 errors: list[str] = []
+                ocr_files: list[str] = []
 
                 for idx, uploaded in enumerate(exam_files):
-                    try:
-                        pdf_path = RAW_DIR / uploaded.name
-                        pdf_path.write_bytes(uploaded.getvalue())
-                        frame = extractor.process_pdf(
-                            pdf_path,
-                            subject=exam_subject.strip(),
-                            year=int(exam_year),
-                        )
-                        processed_frames.append(frame)
-                    except Exception as exc:
-                        logger.exception("PDF processing error: %s", exc)
-                        errors.append(f"{uploaded.name}: {exc}")
+                    status_msg = f"Processing {uploaded.name}…"
+                    with st.spinner(status_msg):
+                        try:
+                            pdf_path = RAW_DIR / uploaded.name
+                            pdf_path.write_bytes(uploaded.getvalue())
+                            frame = extractor.process_pdf(
+                                pdf_path,
+                                subject=exam_subject.strip(),
+                                year=int(exam_year),
+                            )
+                            processed_frames.append(frame)
+                            if extractor.last_used_ocr:
+                                ocr_files.append(uploaded.name)
+                        except Exception as exc:
+                            logger.exception("PDF processing error: %s", exc)
+                            errors.append(f"{uploaded.name}: {exc}")
 
                     progress.progress((idx + 1) / len(exam_files))
 
@@ -303,6 +351,11 @@ def page_upload_process() -> None:
                         f"Extracted {len(combined)} questions for **{exam_subject.strip()}**. "
                         f"Total questions in library: {len(total)}."
                     )
+                    if ocr_files:
+                        st.info(
+                            f"**OCR was used** for {len(ocr_files)} scanned PDF(s): "
+                            + ", ".join(ocr_files)
+                        )
 
                 for err in errors:
                     st.error(err)
@@ -336,18 +389,22 @@ def page_upload_process() -> None:
                 progress = st.progress(0)
                 material_frames: list[pd.DataFrame] = []
                 errors: list[str] = []
+                ocr_ref_files: list[str] = []
 
                 for idx, uploaded in enumerate(ref_files):
-                    try:
-                        pdf_path = RAW_DIR / uploaded.name
-                        pdf_path.write_bytes(uploaded.getvalue())
-                        frame = extractor.process_subject_pdf(
-                            pdf_path, subject=ref_subject.strip()
-                        )
-                        material_frames.append(frame)
-                    except Exception as exc:
-                        logger.exception("Subject PDF error: %s", exc)
-                        errors.append(f"{uploaded.name}: {exc}")
+                    with st.spinner(f"Processing {uploaded.name}…"):
+                        try:
+                            pdf_path = RAW_DIR / uploaded.name
+                            pdf_path.write_bytes(uploaded.getvalue())
+                            frame = extractor.process_subject_pdf(
+                                pdf_path, subject=ref_subject.strip()
+                            )
+                            material_frames.append(frame)
+                            if extractor.last_used_ocr:
+                                ocr_ref_files.append(uploaded.name)
+                        except Exception as exc:
+                            logger.exception("Subject PDF error: %s", exc)
+                            errors.append(f"{uploaded.name}: {exc}")
 
                     progress.progress((idx + 1) / len(ref_files))
 
@@ -359,6 +416,11 @@ def page_upload_process() -> None:
                         f"Saved {len(combined)} subject reference document(s) for "
                         f"**{ref_subject.strip()}**."
                     )
+                    if ocr_ref_files:
+                        st.info(
+                            f"**OCR was used** for {len(ocr_ref_files)} scanned PDF(s): "
+                            + ", ".join(ocr_ref_files)
+                        )
 
                 for err in errors:
                     st.error(err)
@@ -508,6 +570,8 @@ def page_question_predictions() -> None:
                         subject_material=subject_context or None,
                     )
                 st.session_state.generated_questions = generated
+                st.session_state.gen_topic_for_bleu = topic
+                st.session_state.gen_subject_for_bleu = gen_subject
             except Exception as exc:
                 logger.exception("Generation failed: %s", exc)
                 st.error(f"Generation failed: {exc}")
@@ -562,6 +626,53 @@ def _env_gemini_key() -> bool:
     return bool(key and key not in {"your_gemini_key_here", "your_key_here"})
 
 
+_PREVIEW_CHARS = 220  # characters shown before "show full question" expander
+
+
+def _display_question(text: str, label: str = "", max_chars: int = _PREVIEW_CHARS) -> None:
+    """Render a single question with spacing repair and a collapsible full-text expander."""
+    cleaned = fix_spacing(str(text))
+    if label:
+        st.markdown(f"**{label}**")
+    if len(cleaned) <= max_chars:
+        st.markdown(cleaned)
+    else:
+        st.markdown(cleaned[:max_chars].rstrip() + " …")
+        with st.expander("Show full question"):
+            st.markdown(cleaned)
+
+
+def _render_dup_card(row: "pd.Series") -> None:
+    """Render one cross-paper duplicate pair as a styled card."""
+    score = float(row["similarity"])
+    score_pct = f"{score:.1%}"
+
+    if score >= 0.97:
+        score_class, badge = "exact", f"EXACT / NEAR-IDENTICAL — {score_pct}"
+    elif score >= 0.90:
+        score_class, badge = "high", f"VERY SIMILAR — {score_pct}"
+    else:
+        score_class, badge = "medium", f"SIMILAR — {score_pct}"
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown(
+            f'<p class="dup-paper-label">📄 {row["source_a"]} &nbsp;({row["year_a"]})</p>',
+            unsafe_allow_html=True,
+        )
+        _display_question(row["question_a"])
+    with col_b:
+        st.markdown(
+            f'<p class="dup-paper-label">📄 {row["source_b"]} &nbsp;({row["year_b"]})</p>',
+            unsafe_allow_html=True,
+        )
+        _display_question(row["question_b"])
+    st.markdown(
+        f'<p class="dup-score {score_class}">{badge}</p><hr class="dup-divider"/>',
+        unsafe_allow_html=True,
+    )
+
+
 def page_similarity_search() -> None:
     """Render semantic similarity search page."""
     st.title("Similarity Search")
@@ -573,27 +684,128 @@ def page_similarity_search() -> None:
         st.warning("No data available for the selected subject.")
         return
 
-    query = st.text_input("Enter a topic or question to search your uploaded exam papers")
+    tab_query, tab_cross = st.tabs(["Query Search", "Cross-Paper Duplicates"])
 
-    if query and st.button("Find Similar Questions"):
-        embedder = QuestionEmbedder()
-        query_embedding = embedder.encode([query])[0]
-        scores = embedder.cosine_similarity(query_embedding, embeddings)
-        top_indices = scores.argsort()[::-1][:5]
+    # ── Tab 1: query-based search ────────────────────────────────────────────
+    with tab_query:
+        st.write("Type any topic or question to find the closest matches in your uploaded exam papers.")
+        query = st.text_input("Search query", placeholder="e.g. Newton's second law, Dijkstra's algorithm…")
 
-        st.subheader("Top 5 Most Similar Past Questions")
-        for rank, local_idx in enumerate(top_indices, start=1):
-            row = questions_df.iloc[local_idx]
-            st.markdown(
-                f"""
-                <div class="question-card">
-                    <strong>#{rank} | Similarity: {scores[local_idx]:.3f}</strong><br/>
-                    <em>{row.get('subject', '')} — {row.get('topic_label', 'Unknown Topic')} ({row.get('year', 'N/A')})</em><br/>
-                    {row.get('question_text', '')}
-                </div>
-                """,
-                unsafe_allow_html=True,
+        if query and st.button("Find Similar Questions", type="primary"):
+            embedder = QuestionEmbedder()
+            query_embedding = embedder.encode([query])[0]
+            scores = embedder.cosine_similarity(query_embedding, embeddings)
+            top_indices = scores.argsort()[::-1][:5]
+
+            st.subheader("Top 5 Most Similar Past Questions")
+            for rank, local_idx in enumerate(top_indices, start=1):
+                row = questions_df.iloc[local_idx]
+                with st.container():
+                    st.markdown(
+                        f"""
+                        <div class="question-card">
+                            <strong>#{rank} &nbsp;|&nbsp; Similarity: {scores[local_idx]:.3f}</strong><br/>
+                            <em>📄 {row.get('source_file', '')} &nbsp;|&nbsp;
+                            {row.get('subject', '')} — {row.get('topic_label', 'Unknown Topic')}
+                            &nbsp;({row.get('year', 'N/A')})</em>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    _display_question(row.get("question_text", ""))
+
+    # ── Tab 2: cross-paper duplicate detection ───────────────────────────────
+    with tab_cross:
+        st.write(
+            "Automatically find questions that appear in **more than one exam paper** — "
+            "identical repeats or paraphrased variants. "
+            "Useful for spotting high-priority topics that examiners reuse across years."
+        )
+
+        num_pdfs = (
+            int(questions_df["source_file"].nunique())
+            if "source_file" in questions_df.columns
+            else 0
+        )
+
+        if num_pdfs < 2:
+            st.info(
+                "Upload at least **2 exam paper PDFs** to compare them. "
+                "Go to Upload & Process and add more papers."
             )
+        else:
+            st.caption(f"Comparing questions across **{num_pdfs} exam papers**.")
+
+            threshold = st.slider(
+                "Similarity threshold",
+                min_value=0.70,
+                max_value=1.00,
+                value=0.85,
+                step=0.01,
+                help=(
+                    "0.97–1.00 = exact or near-identical wording | "
+                    "0.90–0.96 = very similar / paraphrased | "
+                    "0.85–0.89 = same concept, different wording"
+                ),
+            )
+
+            if st.button("Find Repeated Questions Across Papers", type="primary"):
+                evaluator = ExamEvaluator()
+                with st.spinner("Computing pairwise similarity across all papers…"):
+                    pairs_df = evaluator.find_cross_paper_duplicates(
+                        questions_df, embeddings, threshold=threshold
+                    )
+
+                if pairs_df.empty:
+                    st.info(
+                        f"No question pairs found above **{threshold:.0%}** similarity. "
+                        "Try lowering the threshold."
+                    )
+                else:
+                    n_pairs = len(pairs_df)
+                    pdf_pairs = (
+                        pairs_df[["source_a", "source_b"]]
+                        .drop_duplicates()
+                        .shape[0]
+                    )
+                    exact_count = int((pairs_df["similarity"] >= 0.97).sum())
+                    high_count = int(
+                        ((pairs_df["similarity"] >= 0.90) & (pairs_df["similarity"] < 0.97)).sum()
+                    )
+
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Similar Pairs Found", n_pairs)
+                    m2.metric("PDF Pairs Compared", pdf_pairs)
+                    m3.metric("Exact / Near-Identical", exact_count)
+                    m4.metric("Very Similar", high_count)
+
+                    # CSV export
+                    export_cols = [
+                        "similarity", "source_a", "year_a", "question_a",
+                        "source_b", "year_b", "question_b",
+                    ]
+                    st.download_button(
+                        "Download Results as CSV",
+                        data=pairs_df[export_cols].to_csv(index=False).encode("utf-8"),
+                        file_name="cross_paper_duplicates.csv",
+                        mime="text/csv",
+                    )
+
+                    st.divider()
+
+                    # Group by PDF pair and show expanders
+                    grouped = pairs_df.groupby(["source_a", "source_b"], sort=False)
+                    for (src_a, src_b), group in grouped:
+                        n = len(group)
+                        exact_in_group = int((group["similarity"] >= 0.97).sum())
+                        label = (
+                            f"📄 {src_a}  ↔  📄 {src_b} "
+                            f"— {n} match{'es' if n != 1 else ''}"
+                            + (f"  ({exact_in_group} exact)" if exact_in_group else "")
+                        )
+                        with st.expander(label, expanded=(n_pairs <= 20)):
+                            for _, pair_row in group.iterrows():
+                                _render_dup_card(pair_row)
 
 
 def page_analytics_dashboard() -> None:
@@ -643,6 +855,300 @@ def page_analytics_dashboard() -> None:
     )
 
 
+def _silhouette_label(score: float) -> tuple[str, str]:
+    """Return (emoji+text, colour) interpretation for a silhouette score."""
+    if score >= 0.70:
+        return "Strong clustering — topics are well separated", "normal"
+    if score >= 0.50:
+        return "Reasonable clustering — moderate topic overlap", "normal"
+    if score >= 0.25:
+        return "Weak clustering — topics overlap significantly", "off"
+    return "Poor clustering — consider uploading more questions", "inverse"
+
+
+def _compute_tsne(questions_df: pd.DataFrame, embeddings) -> pd.DataFrame:
+    """Project embeddings to 2D via t-SNE and return a plot-ready DataFrame."""
+    from sklearn.manifold import TSNE
+
+    n = len(embeddings)
+    perplexity = min(30, max(5, (n - 1) // 4))
+    coords = TSNE(
+        n_components=2,
+        random_state=42,
+        perplexity=perplexity,
+        max_iter=1000,
+        init="pca",
+        learning_rate="auto",
+    ).fit_transform(embeddings)
+
+    q = questions_df.reset_index(drop=True)
+    return pd.DataFrame({
+        "x": coords[:, 0].round(3),
+        "y": coords[:, 1].round(3),
+        "topic_label": q.get("topic_label", pd.Series(["Unknown"] * n)).fillna("Unknown").values,
+        "year": q.get("year", pd.Series(["N/A"] * n)).astype(str).values,
+        "subject": q.get("subject", pd.Series([""] * n)).astype(str).values,
+        "question_preview": q["question_text"].astype(str).str[:100].values,
+    })
+
+
+def _compute_bleu_rouge(
+    generated_questions: list,
+    reference_questions: list[str],
+) -> pd.DataFrame:
+    """Return BLEU-1, BLEU-2, ROUGE-1, ROUGE-L per generated question."""
+    if not generated_questions or not reference_questions:
+        return pd.DataFrame()
+    try:
+        from nltk.tokenize import word_tokenize
+        from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
+    except ImportError:
+        return pd.DataFrame()
+
+    smoother = SmoothingFunction().method1
+    ref_tokens = [word_tokenize(q.lower()) for q in reference_questions if q.strip()]
+
+    rouge_scorer_obj = None
+    try:
+        from rouge_score import rouge_scorer as _rs
+        rouge_scorer_obj = _rs.RougeScorer(["rouge1", "rougeL"], use_stemmer=True)
+    except ImportError:
+        pass
+
+    rows = []
+    for item in generated_questions:
+        gen_text = str(item.get("question", "")).strip()
+        if not gen_text:
+            continue
+        hyp_tokens = word_tokenize(gen_text.lower())
+        b1 = sentence_bleu(ref_tokens, hyp_tokens, weights=(1, 0, 0, 0), smoothing_function=smoother)
+        b2 = sentence_bleu(ref_tokens, hyp_tokens, weights=(0.5, 0.5, 0, 0), smoothing_function=smoother)
+        row = {
+            "Question": gen_text[:110] + ("…" if len(gen_text) > 110 else ""),
+            "Type": item.get("type", ""),
+            "Difficulty": item.get("difficulty", ""),
+            "BLEU-1": round(b1, 4),
+            "BLEU-2": round(b2, 4),
+        }
+        if rouge_scorer_obj is not None:
+            best_r1 = best_rL = 0.0
+            for ref in reference_questions[:30]:
+                r = rouge_scorer_obj.score(ref, gen_text)
+                if r["rouge1"].fmeasure > best_r1:
+                    best_r1 = r["rouge1"].fmeasure
+                    best_rL = r["rougeL"].fmeasure
+            row["ROUGE-1"] = round(best_r1, 4)
+            row["ROUGE-L"] = round(best_rL, 4)
+        rows.append(row)
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+def _get_tsne_cached(questions_df: pd.DataFrame, embeddings) -> pd.DataFrame:
+    """Return t-SNE DataFrame, cached in session_state to avoid recomputing."""
+    cache_key = f"_tsne_{len(questions_df)}_{embeddings.shape[0]}"
+    if cache_key not in st.session_state:
+        st.session_state[cache_key] = _compute_tsne(questions_df, embeddings)
+    return st.session_state[cache_key]
+
+
+def page_evaluation_metrics() -> None:
+    """Render evaluation and performance metrics page."""
+    st.title("Evaluation Metrics")
+    st.caption(
+        "Quantitative assessment of clustering quality, embedding structure, "
+        "and generated question similarity."
+    )
+
+    if not run_full_analysis():
+        return
+
+    questions_df, topics_df, embeddings = get_filtered_data()
+    if questions_df.empty or embeddings is None:
+        st.warning("No data available for the selected subject filter.")
+        return
+
+    tab_cluster, tab_tsne, tab_bleu = st.tabs([
+        "Clustering Quality",
+        "Embedding Visualisation (t-SNE)",
+        "Generation Quality (BLEU / ROUGE)",
+    ])
+
+    # ── Tab 1: Clustering Quality ────────────────────────────────────────────
+    with tab_cluster:
+        st.subheader("KMeans Clustering Quality")
+
+        sil_score = float(st.session_state.get("silhouette_score", 0.0))
+
+        # Recompute if filtered view differs from full dataset
+        if "topic_id" in questions_df.columns and len(set(questions_df["topic_id"])) >= 2:
+            from sklearn.metrics import silhouette_score as _sil
+            try:
+                sil_score = float(_sil(embeddings, questions_df["topic_id"].values))
+            except Exception:
+                pass
+
+        interp, delta_color = _silhouette_label(sil_score)
+        n_topics = int(topics_df["topic_label"].nunique()) if not topics_df.empty else 0
+        avg_q = int(len(questions_df) / n_topics) if n_topics else 0
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Silhouette Score", f"{sil_score:.4f}", delta=interp, delta_color=delta_color)
+        c2.metric("Topics (Clusters)", n_topics)
+        c3.metric("Avg Questions / Topic", avg_q)
+
+        st.info(
+            "**Silhouette Score** ranges from -1 to 1.  "
+            "Values above **0.50** indicate well-separated topic clusters.  "
+            "This score was maximised automatically over 3–10 clusters using the "
+            "silhouette criterion during the KMeans fitting step."
+        )
+
+        st.divider()
+        st.subheader("Topic-level Breakdown")
+        if not topics_df.empty:
+            display = topics_df[["topic_label", "question_count", "trend"]].copy()
+            display["% of questions"] = (
+                display["question_count"] / display["question_count"].sum() * 100
+            ).round(1).astype(str) + "%"
+            st.dataframe(display, use_container_width=True, hide_index=True)
+
+            # Bar chart: topic sizes
+            fig = px.bar(
+                display.sort_values("question_count", ascending=True),
+                x="question_count",
+                y="topic_label",
+                orientation="h",
+                title="Questions per Topic",
+                labels={"question_count": "Questions", "topic_label": "Topic"},
+                template="plotly_dark",
+            )
+            fig.update_layout(margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+    # ── Tab 2: t-SNE Embedding Visualisation ────────────────────────────────
+    with tab_tsne:
+        st.subheader("Question Embedding Space — t-SNE Projection")
+        st.write(
+            "Each dot is one exam question projected from a 384-dimensional semantic "
+            "embedding to 2D.  Questions that cluster together share similar meaning.  "
+            "Colours represent the automatically discovered topic groups."
+        )
+        st.caption(
+            "Note: t-SNE preserves local neighbourhood structure, not global distances.  "
+            "Cluster sizes and inter-cluster distances are not directly comparable."
+        )
+
+        n = len(embeddings)
+        if n < 6:
+            st.warning("At least 6 questions are needed for a meaningful t-SNE plot.")
+        else:
+            if st.button("Generate t-SNE Plot", type="primary"):
+                with st.spinner(f"Projecting {n} questions to 2D — this may take ~10s…"):
+                    tsne_df = _get_tsne_cached(questions_df, embeddings)
+
+                fig = px.scatter(
+                    tsne_df,
+                    x="x",
+                    y="y",
+                    color="topic_label",
+                    hover_data={"x": False, "y": False,
+                                "question_preview": True, "year": True, "subject": True},
+                    title="Question Embeddings — t-SNE 2D",
+                    template="plotly_dark",
+                    labels={"topic_label": "Topic", "question_preview": "Question"},
+                )
+                fig.update_traces(marker=dict(size=7, opacity=0.8))
+                fig.update_layout(
+                    margin=dict(l=10, r=10, t=50, b=10),
+                    legend=dict(orientation="v", x=1.01, y=0.5),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Download t-SNE data
+                st.download_button(
+                    "Download t-SNE Coordinates (CSV)",
+                    data=tsne_df.to_csv(index=False).encode("utf-8"),
+                    file_name="tsne_embeddings.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.info("Click **Generate t-SNE Plot** above to visualise the embedding space.")
+
+    # ── Tab 3: BLEU / ROUGE ─────────────────────────────────────────────────
+    with tab_bleu:
+        st.subheader("Generated Question Quality — BLEU & ROUGE")
+        st.write(
+            "Measures how closely the **Gemini-generated** questions resemble real past "
+            "exam questions in vocabulary and phrasing.  "
+            "Go to **Question Predictions**, generate questions, then return here."
+        )
+        st.info(
+            "**Interpreting scores:** BLEU and ROUGE measure n-gram overlap with "
+            "reference questions.  For question *generation*, moderate scores "
+            "**(0.10–0.40)** are ideal — they show the questions follow exam style "
+            "without being verbatim copies.  Very high scores (>0.60) would indicate "
+            "repetition; very low scores (<0.05) may mean off-topic output."
+        )
+
+        generated = st.session_state.get("generated_questions", [])
+        gen_topic = st.session_state.get("gen_topic_for_bleu", "")
+        gen_subject = st.session_state.get("gen_subject_for_bleu", "")
+
+        if not generated:
+            st.warning("No generated questions yet. Go to **Question Predictions** and generate some first.")
+        else:
+            # Build reference corpus from same topic/subject
+            ref_df = questions_df.copy()
+            all_refs = ref_df["question_text"].dropna().tolist()
+            if gen_topic:
+                topic_refs = ref_df[ref_df["topic_label"] == gen_topic]["question_text"].tolist()
+                # Need ≥10 topic questions for BLEU to be meaningful; fall back to full corpus.
+                reference_questions = topic_refs if len(topic_refs) >= 10 else all_refs
+            else:
+                reference_questions = all_refs
+
+            st.caption(
+                f"Comparing **{len(generated)} generated question(s)** against "
+                f"**{len(reference_questions)} reference question(s)** "
+                f"from topic: *{gen_topic or 'all'}* / subject: *{gen_subject or 'all'}*."
+            )
+
+            with st.spinner("Computing BLEU & ROUGE scores…"):
+                scores_df = _compute_bleu_rouge(generated, reference_questions)
+
+            if scores_df.empty:
+                st.error("Could not compute scores. Ensure NLTK data is downloaded.")
+            else:
+                score_cols = [c for c in ["BLEU-1", "BLEU-2", "ROUGE-1", "ROUGE-L"] if c in scores_df.columns]
+
+                # Summary metrics row
+                avg = scores_df[score_cols].mean()
+                cols = st.columns(len(score_cols))
+                for col, metric in zip(cols, score_cols):
+                    col.metric(f"Avg {metric}", f"{avg[metric]:.4f}")
+
+                st.divider()
+                st.dataframe(
+                    scores_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Question": st.column_config.TextColumn(width="large"),
+                        "BLEU-1": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.4f"),
+                        "BLEU-2": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.4f"),
+                        "ROUGE-1": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.4f"),
+                        "ROUGE-L": st.column_config.ProgressColumn(min_value=0, max_value=1, format="%.4f"),
+                    },
+                )
+
+                st.download_button(
+                    "Download Scores as CSV",
+                    data=scores_df.to_csv(index=False).encode("utf-8"),
+                    file_name="bleu_rouge_scores.csv",
+                    mime="text/csv",
+                )
+
+
 def main() -> None:
     """Main Streamlit application entry point."""
     init_session_state()
@@ -655,6 +1161,7 @@ def main() -> None:
         "Question Predictions": page_question_predictions,
         "Similarity Search": page_similarity_search,
         "Analytics Dashboard": page_analytics_dashboard,
+        "Evaluation Metrics": page_evaluation_metrics,
     }
     pages[page]()
 

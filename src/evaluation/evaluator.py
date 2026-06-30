@@ -184,3 +184,189 @@ class ExamEvaluator:
         )
         fig.update_layout(margin=dict(l=20, r=20, t=50, b=20))
         return fig
+
+    @staticmethod
+    def find_cross_paper_duplicates(
+        questions_df: pd.DataFrame,
+        embeddings: np.ndarray,
+        threshold: float = 0.85,
+    ) -> pd.DataFrame:
+        """Find similar or repeated questions that appear across different exam papers.
+
+        Uses vectorised cosine similarity so it stays fast even for large question sets.
+
+        Args:
+            questions_df: Questions dataframe (must have source_file column).
+            embeddings: Embedding matrix aligned with questions_df rows.
+            threshold: Minimum cosine similarity to consider two questions similar.
+
+        Returns:
+            DataFrame of matching pairs sorted by similarity descending, with columns:
+            similarity, question_a, source_a, year_a, subject_a,
+            question_b, source_b, year_b, subject_b.
+            Empty DataFrame if fewer than two distinct PDFs are present.
+        """
+        from sklearn.metrics.pairwise import cosine_similarity as _sk_cosine
+
+        if embeddings is None or len(questions_df) < 2:
+            return pd.DataFrame()
+
+        q = questions_df.reset_index(drop=True)
+
+        sources = (
+            q["source_file"].astype(str).values
+            if "source_file" in q.columns
+            else np.full(len(q), "")
+        )
+        if len(set(sources)) < 2:
+            return pd.DataFrame()
+
+        sim_matrix = _sk_cosine(embeddings).astype(np.float32)
+
+        # Vectorised: find all upper-triangle pairs above threshold
+        i_idx, j_idx = np.where(np.triu(sim_matrix >= threshold, k=1))
+
+        if len(i_idx) == 0:
+            return pd.DataFrame()
+
+        # Keep only pairs from different source PDFs
+        diff_mask = sources[i_idx] != sources[j_idx]
+        i_idx = i_idx[diff_mask]
+        j_idx = j_idx[diff_mask]
+
+        if len(i_idx) == 0:
+            return pd.DataFrame()
+
+        texts = q["question_text"].astype(str).values
+        years = q["year"].values if "year" in q.columns else np.full(len(q), "N/A")
+        subjects = (
+            q["subject"].astype(str).values if "subject" in q.columns else np.full(len(q), "")
+        )
+
+        result = pd.DataFrame(
+            {
+                "similarity": np.round(sim_matrix[i_idx, j_idx].astype(float), 4),
+                "question_a": texts[i_idx],
+                "source_a": sources[i_idx],
+                "year_a": years[i_idx],
+                "subject_a": subjects[i_idx],
+                "question_b": texts[j_idx],
+                "source_b": sources[j_idx],
+                "year_b": years[j_idx],
+                "subject_b": subjects[j_idx],
+            }
+        )
+        return result.sort_values("similarity", ascending=False).reset_index(drop=True)
+
+    @staticmethod
+    def compute_tsne(
+        questions_df: pd.DataFrame,
+        embeddings: np.ndarray,
+        perplexity: int = 30,
+    ) -> pd.DataFrame:
+        """Reduce embeddings to 2D via t-SNE for cluster visualization.
+
+        Args:
+            questions_df: Questions dataframe aligned row-for-row with embeddings.
+            embeddings: Embedding matrix (n_questions × embedding_dim).
+            perplexity: t-SNE perplexity — auto-capped to (n_samples - 1) // 4.
+
+        Returns:
+            DataFrame with columns: x, y, topic_label, year, subject, question_preview.
+        """
+        from sklearn.manifold import TSNE
+
+        n = len(embeddings)
+        actual_perplexity = min(perplexity, max(5, (n - 1) // 4))
+
+        coords = TSNE(
+            n_components=2,
+            random_state=42,
+            perplexity=actual_perplexity,
+            max_iter=1000,
+            init="pca",
+            learning_rate="auto",
+        ).fit_transform(embeddings)
+
+        q = questions_df.reset_index(drop=True)
+        return pd.DataFrame(
+            {
+                "x": coords[:, 0].round(3),
+                "y": coords[:, 1].round(3),
+                "topic_label": q.get("topic_label", pd.Series(["Unknown"] * n)).fillna("Unknown").values,
+                "year": q.get("year", pd.Series(["N/A"] * n)).astype(str).values,
+                "subject": q.get("subject", pd.Series([""] * n)).astype(str).values,
+                "question_preview": q["question_text"].astype(str).str[:100].values,
+            }
+        )
+
+    @staticmethod
+    def compute_bleu_rouge(
+        generated_questions: list[dict[str, Any]],
+        reference_questions: list[str],
+    ) -> pd.DataFrame:
+        """Compute BLEU-1, BLEU-2, ROUGE-1, ROUGE-L for each generated question.
+
+        Scores measure stylistic and vocabulary similarity between generated
+        questions and real past exam questions.  Moderate scores (0.1–0.4) are
+        expected and desirable — they show the generated questions follow exam
+        patterns without copying them verbatim.
+
+        Args:
+            generated_questions: List of dicts with at least a 'question' key.
+            reference_questions: Past exam questions used as the reference corpus.
+
+        Returns:
+            DataFrame with one row per generated question and score columns.
+            Returns empty DataFrame if NLTK resources are unavailable.
+        """
+        if not generated_questions or not reference_questions:
+            return pd.DataFrame()
+
+        try:
+            from nltk.tokenize import word_tokenize
+            from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
+        except ImportError:
+            return pd.DataFrame()
+
+        smoother = SmoothingFunction().method1
+        ref_tokens = [word_tokenize(q.lower()) for q in reference_questions if q.strip()]
+
+        rouge_scorer_obj = None
+        try:
+            from rouge_score import rouge_scorer as _rs
+            rouge_scorer_obj = _rs.RougeScorer(["rouge1", "rougeL"], use_stemmer=True)
+        except ImportError:
+            pass
+
+        rows: list[dict[str, Any]] = []
+        for item in generated_questions:
+            gen_text = str(item.get("question", "")).strip()
+            if not gen_text:
+                continue
+
+            hyp_tokens = word_tokenize(gen_text.lower())
+            bleu1 = sentence_bleu(ref_tokens, hyp_tokens, weights=(1, 0, 0, 0), smoothing_function=smoother)
+            bleu2 = sentence_bleu(ref_tokens, hyp_tokens, weights=(0.5, 0.5, 0, 0), smoothing_function=smoother)
+
+            row: dict[str, Any] = {
+                "Question": gen_text[:110] + ("…" if len(gen_text) > 110 else ""),
+                "Type": item.get("type", ""),
+                "Difficulty": item.get("difficulty", ""),
+                "BLEU-1": round(bleu1, 4),
+                "BLEU-2": round(bleu2, 4),
+            }
+
+            if rouge_scorer_obj is not None:
+                best_r1, best_rL = 0.0, 0.0
+                for ref in reference_questions[:30]:
+                    r = rouge_scorer_obj.score(ref, gen_text)
+                    if r["rouge1"].fmeasure > best_r1:
+                        best_r1 = r["rouge1"].fmeasure
+                        best_rL = r["rougeL"].fmeasure
+                row["ROUGE-1"] = round(best_r1, 4)
+                row["ROUGE-L"] = round(best_rL, 4)
+
+            rows.append(row)
+
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
