@@ -1,302 +1,237 @@
-# AI-Powered Exam Pattern Analysis and Question Prediction System
+# Multi-Agent-Based AI-Powered Exam Pattern Analysis and Question Prediction System
 
-<<<<<<< Updated upstream
-Analyze **your own** past examination papers using NLP and OpenAI to discover question patterns, identify important topics, and generate probable future exam questions.
-=======
-An end-to-end system that analyzes a user's own past examination papers to discover recurring question patterns, identify important topics, and generate probable future exam questions — powered by Mistral OCR, Pinecone vector retrieval, cross-encoder reranking, and a multi-agent orchestration layer.
->>>>>>> Stashed changes
+**Advanced Artificial Intelligence — Group Project**
 
-The system uses **no sample or fixture data**. Every result is derived from PDFs the user uploads, and subjects are entirely user-defined (e.g. Physics, Law, Nursing, Finance) rather than drawn from a fixed list.
+A Streamlit application that analyzes a student's own past exam papers using OCR, sentence embeddings, unsupervised topic clustering, retrieval-augmented generation, and a multi-agent LLM workflow to discover recurring question patterns and generate probable future exam questions.
+
+
 
 ---
 
-<<<<<<< Updated upstream
-- **Past Exam Paper Upload** — Extract questions from PDF exam papers (any subject)
-- **Subject PDF Upload** — Add syllabus, notes, or textbook PDFs as OpenAI context
-- **Dynamic Topic Discovery** — KMeans clustering on your exam content (no predefined topics)
-- **OpenAI Question Generation** — GPT-4o generates new questions from your patterns
-- **Multi-Subject Support** — Upload papers for multiple subjects and filter analysis
-- **Interactive Dashboard** — Topic charts, similarity search, analytics, CSV/PDF export
+## 1. Problem Statement
 
-## Tech Stack
+Students preparing for exams often revisit years of past papers manually, trying to spot which topics repeat and which questions are likely to reappear. This is slow, subjective, and doesn't scale across subjects. This project automates that process: it ingests past exam papers (and optional syllabus/lecture material) for **any subject**, discovers the underlying topic structure directly from the content, and uses a language model — grounded in retrieved, relevant context — to draft new questions that plausibly reflect the observed exam pattern.
 
-- Python 3.12+, Streamlit, OpenAI API
-- Sentence Transformers, Scikit-learn, NLTK
-- pdfplumber, Plotly, Pandas
-=======
-## Table of Contents
-
-1. [Overview](#overview)
-2. [Key Features](#key-features)
-3. [System Architecture](#system-architecture)
-4. [Tech Stack](#tech-stack)
-5. [Project Structure](#project-structure)
-6. [Installation & Setup](#installation--setup)
-7. [Running the Application](#running-the-application)
-8. [User Guide](#user-guide)
-9. [Retrieval Evaluation Metrics](#retrieval-evaluation-metrics)
-10. [Known Limitations](#known-limitations)
-11. [License](#license)
+The system is intentionally domain-agnostic: no subject list, question bank, or topic taxonomy is hard-coded. Everything is derived from what the user uploads.
 
 ---
 
-## Overview
+## 2. AI Techniques Implemented
 
-Students and educators often want to know *what is likely to be asked next* based on how a subject has been examined historically. This project automates that analysis:
+This project satisfies the assignment's "minimum three techniques" requirement with the following:
 
-1. Past exam papers are OCR'd and segmented into individual questions.
-2. Questions (and optional syllabus/lecture material) are embedded and indexed in a vector database.
-3. Topics are discovered automatically via clustering — no topic list is hand-defined.
-4. When a user asks for predictions on a topic, the system retrieves the most relevant historical evidence, reranks it for relevance, and prompts an LLM to generate new, plausible exam questions grounded in that evidence.
-5. A dedicated evaluation module measures how good the retrieval step actually is, using standard information-retrieval metrics.
+| # | Technique | Where it's used |
+|---|---|---|
+| 1 | **NLP — text pre/post-processing** | `src/preprocessing/`, `src/classification/topic_classifier.py`: OCR text cleaning, tokenization, stopword removal, lemmatization, question segmentation |
+| 2 | **Transformer-based models** | `src/embeddings/embedder.py` (BGE sentence embeddings), `src/retrieval/reranker.py` (cross-encoder reranking), `src/classification/bert_classifier.py` (zero-shot DistilBERT classification) |
+| 3 | **Prompt engineering** | `src/generation/question_generator.py`: three selectable strategies — direct, chain-of-thought, and context-aware (retrieval-grounded) prompting for the Mistral LLM |
+| 4 (bonus) | **Retrieval-Augmented Generation** | `src/retrieval/pinecone_store.py` + reranker feed retrieved context into generation, evaluated quantitatively (see §6) |
 
-## Key Features
+---
 
-| Feature | Description |
+## 3. System Architecture
+
+```
+                 ┌─────────────────────┐
+ PDF Upload ───▶ │   Mistral OCR /      │
+ (past papers,   │   pdfplumber/pypdf   │
+ lecture notes)  │   extraction         │
+                 └──────────┬───────────┘
+                            ▼
+                 ┌─────────────────────┐
+                 │  Text Cleaning &     │
+                 │  Question Segment.   │  (src/preprocessing)
+                 └──────────┬───────────┘
+                            ▼
+                 ┌─────────────────────┐
+                 │  Sentence Embeddings │  (BAAI/bge-large-en-v1.5)
+                 └──────────┬───────────┘
+                            ▼
+        ┌───────────────────┴────────────────────┐
+        ▼                                         ▼
+┌───────────────────┐                   ┌───────────────────────┐
+│ KMeans Topic        │                   │ Pinecone Vector Index  │
+│ Clustering           │                   │ (semantic retrieval)   │
+│ (dynamic, no fixed   │                   └───────────┬────────────┘
+│ topic list)          │                               ▼
+└──────────┬──────────┘                   ┌───────────────────────┐
+           │                               │ Cross-Encoder Reranker │
+           │                               └───────────┬────────────┘
+           ▼                                            ▼
+┌────────────────────────────────────────────────────────────────┐
+│           Multi-Agent Workflow (LangGraph-style)                 │
+│  PastPaperAgent → LecturePdfAgent → PredictionAgent → Eval Agent  │
+└──────────────────────────────┬───────────────────────────────────┘
+                                 ▼
+                    ┌────────────────────────┐
+                    │ Mistral LLM              │
+                    │ (question generation,    │
+                    │  prompt-engineered)       │
+                    └───────────┬───────────────┘
+                                 ▼
+                    ┌────────────────────────┐
+                    │ Streamlit Dashboard      │
+                    │ (topics, predictions,    │
+                    │  evaluation, export)      │
+                    └────────────────────────┘
+```
+
+**Agent roles** (`src/agents/exam_agents.py`):
+- **PastPaperAgent** — ingests past exam PDFs into structured question rows
+- **LecturePdfAgent** — ingests syllabus/lecture PDFs into reference chunks
+- **ExamAgentSystem** — indexes both corpora into Pinecone
+- **PredictionAgent** — retrieves relevant context, reranks it, and prepares the generation prompt
+- **EvaluationAgent** — reuses the retrieval path to compute ranking quality metrics
+
+If `langgraph` is installed, these steps run as nodes in a `StateGraph`; otherwise the app falls back to the same steps called directly in Python, so the workflow behaves identically either way.
+
+---
+
+## 4. Features
+
+- **Past exam paper upload** — extracts individual questions from PDF exam papers via Mistral OCR
+- **Subject reference upload** — syllabus/notes/textbook PDFs indexed as retrieval context
+- **Dynamic topic discovery** — KMeans clustering (silhouette-selected *k*) over embeddings, no predefined topics
+- **Retrieval-augmented question prediction** — Pinecone retrieval + cross-encoder reranking + Mistral generation
+- **Configurable prompting** — direct / chain-of-thought / context-aware strategies, adjustable difficulty
+- **Multi-subject support** — any number of subjects, filterable throughout the dashboard
+- **Retrieval evaluation** — Precision@k, Recall@k, MRR, nDCG computed on demand
+- **Analytics dashboard** — topic trends, year-wise distribution, similarity search, CSV/PDF export
+
+---
+
+## 5. Tech Stack
+
+| Layer | Tools |
 |---|---|
-| **Past Exam Paper Upload** | Extracts individual questions from PDF exam papers using Mistral OCR |
-| **Subject PDF Upload** | Adds syllabus, notes, or textbook PDFs as retrieval context |
-| **Dynamic Topic Discovery** | K-Means clustering over exam content — topics emerge from the data, not a predefined taxonomy |
-| **Retrieval-Augmented Prediction** | Pinecone stores question/material embeddings; a cross-encoder reranks retrieved candidates before generation |
-| **Multi-Agent Workflow** | Ingestion, retrieval, generation, and evaluation are separated into distinct agents coordinated by a central orchestrator |
-| **Mistral Question Generation** | Mistral chat completions generate new questions grounded in retrieved patterns and subject material |
-| **Multi-Subject Support** | Multiple subjects can be uploaded and analyzed independently, with sidebar filtering |
-| **Interactive Dashboard** | Topic visualizations, similarity search, retrieval evaluation, analytics, and CSV/PDF export, built in Streamlit |
+| Interface | Streamlit, Plotly |
+| OCR / extraction | Mistral OCR, pdfplumber, pypdf |
+| NLP | NLTK, spaCy |
+| Embeddings | Sentence-Transformers (`BAAI/bge-large-en-v1.5`) |
+| Classification | DistilBERT zero-shot (`typeform/distilbert-base-uncased-mnli`) |
+| Clustering | scikit-learn (KMeans, TF-IDF, silhouette score) |
+| Vector store | Pinecone |
+| Reranking | Cross-encoder (`ms-marco-MiniLM-L-6-v2`) |
+| Generation | Mistral chat completions |
+| Orchestration | LangGraph-style multi-agent workflow |
+| Language / runtime | Python 3.12+ |
 
-## System Architecture
+---
 
-### Data Flow
+## 6. Retrieval Evaluation Results
 
-```
-PDF upload (Streamlit)
-        │
-        ▼
-Mistral OCR  →  page-level Markdown/text
-        │
-        ├── Past-paper PDFs  →  segmented question rows
-        └── Lecture/syllabus PDFs → reference text chunks
-        │
-        ▼
-Sentence-Transformer embeddings
-        │
-        ▼
-Pinecone vector index (namespaces: "past-papers", "lecture-pdfs")
-        │
-        ▼
-Top-K retrieval  →  cross-encoder reranking
-        │
-        ▼
-Mistral chat completion  →  generated questions
-        │
-        ▼
-Retrieval evaluation (Precision@k, Recall@k, MRR, nDCG@k)
-```
+Retrieval quality was measured against relevance-labelled queries over the indexed exam corpus (Precision/Recall/MRR/nDCG @ k = 5):
 
-### Agent Responsibilities
+| Metric | Score | Rating |
+|---|---|---|
+| Precision@5 | 0.664 | Good |
+| Recall@5 | 1.000 | Perfect |
+| MRR | 0.513 | Moderate |
+| nDCG@5 | 0.731 | Good |
 
-The codebase organizes this pipeline into cooperating agent classes (`src/agents/exam_agents.py`):
+**Interpretation:** Recall is perfect — no relevant past question is ever missed by the retriever, which matters most for this use case since a missed pattern means a missed prediction signal. MRR indicates the single best match typically lands around rank 2 rather than rank 1, suggesting the cross-encoder reranker has room to improve with domain-specific fine-tuning. Full methodology, formulas, and improvement suggestions are in the [Retrieval Evaluation Metrics](#retrieval-evaluation-metrics-detail) section below and can be reproduced live from the app's **Retrieval Evaluation** tab.
 
-| Agent | Responsibility |
-|---|---|
-| `PastPaperAgent` | Ingests past exam PDFs and converts them into structured question rows |
-| `LecturePdfAgent` | Ingests syllabus/notes PDFs and converts them into reference chunks |
-| `ExamAgentSystem` | Owns the shared vector store, reranker, and generator; indexes both corpora into Pinecone |
-| `PredictionAgent` | Retrieves relevant context, reranks it, and prepares generation input for Mistral |
-| `EvaluationAgent` | Reuses the retrieval path to compute ranking-quality metrics |
+---
 
-> **Note on orchestration:** the workflow is structured as a graph of single-responsibility agents in the "LangGraph style," but the current implementation runs this control flow directly in Python — `langgraph` is not a runtime dependency in `requirements.txt`. If it were installed, the code includes a routing path that would delegate to it; without it, the app falls back to the equivalent direct function calls with identical results.
-
-## Tech Stack
-
-- **Language / Runtime:** Python 3.12+
-- **Application layer:** Streamlit
-- **OCR:** Mistral OCR API
-- **Embeddings:** Sentence Transformers
-- **Vector store:** Pinecone
-- **Reranking:** Cross-encoder model
-- **Generation:** Mistral chat completions
-- **Clustering:** Scikit-learn (K-Means)
-- **NLP preprocessing:** NLTK
-- **Visualization:** Plotly
-- **Data handling:** Pandas, NumPy
->>>>>>> Stashed changes
-
-## Project Structure
+## 7. Project Structure
 
 ```
-exam-pattern-analysis/
+Exam-Pattern-Analysis/
 ├── app/
-│   └── streamlit_app.py        # Main dashboard entry point
+│   └── streamlit_app.py         # Main dashboard entry point
 ├── src/
-│   ├── agents/                 # Multi-agent orchestration (exam_agents.py)
-│   ├── preprocessing/          # PDF extraction and text cleaning
-│   ├── ocr/                    # Mistral OCR wrapper
-│   ├── embeddings/             # Sentence-embedding generation
-│   ├── classification/         # Topic clustering / classification
-│   ├── retrieval/               # Pinecone vector store + reranker
-│   ├── evaluation/              # Retrieval metrics + evaluator
-│   ├── generation/              # Mistral-based question generation
-│   ├── pipeline.py              # Shared data loading / subject utilities
-│   └── utils.py                 # Logging and path configuration
-├── scripts/                    # Utility scripts (OCR smoke test, project validation, sample data)
+│   ├── preprocessing/            # PDF extraction, OCR, text cleaning
+│   ├── ocr/                      # Mistral OCR client
+│   ├── embeddings/               # Sentence embedding + caching
+│   ├── classification/           # Topic clustering, BERT question typing
+│   ├── retrieval/                # Pinecone store, cross-encoder reranker
+│   ├── generation/                # Prompt-engineered question generation
+│   ├── evaluation/                # Retrieval metrics, analytics
+│   ├── agents/                   # Multi-agent orchestration (LangGraph)
+│   ├── pipeline.py               # Data loading + analysis pipeline
+│   └── utils.py                  # Shared paths/logging
+├── scripts/                       # Setup, validation, smoke-test utilities
 ├── data/
-│   ├── raw/                    # User-uploaded source PDFs
-│   └── processed/              # questions.csv, subject_materials.csv (generated, git-ignored)
-├── reports/                    # Project report and generated summaries
-├── requirements.txt
-└── README.md
+│   ├── raw/                       # Uploaded source PDFs
+│   └── processed/                 # Generated questions.csv, materials.csv
+├── reports/                       # Final report, organized outputs, logs
+├── notebooks/                     # Exploratory notebooks
+└── requirements.txt
 ```
 
-## Installation & Setup
+---
 
-**Prerequisites:** Python 3.12+, a Mistral API key, and a Pinecone API key/index.
+## 8. Setup & Installation
 
 ```powershell
-Set-Location C:\Users\User\exam-pattern-analysis
+git clone https://github.com/Parakkrama24/Exam-Pattern-Analysis.git
+cd Exam-Pattern-Analysis
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab'); nltk.download('stopwords'); nltk.download('wordnet'); nltk.download('omw-1.4')"
 ```
 
-<<<<<<< Updated upstream
-Edit `.env` and set your API key:
-=======
-Create a `.env` file in the project root with the following variables:
->>>>>>> Stashed changes
+Create a `.env` file in the project root with:
 
 ```env
-GEMINI_API_KEY=AQ.your-real-key-here
+MISTRAL_API_KEY=your-real-key-here
+PINECONE_API_KEY=your-real-key-here
+PINECONE_INDEX_NAME=quickstart
+MISTRAL_CHAT_MODEL=mistral-medium-latest
 ```
 
-| Variable | Required | Purpose |
-|---|---|---|
-| `MISTRAL_API_KEY` | Yes | OCR and question generation |
-| `PINECONE_API_KEY` | Yes | Vector storage and retrieval |
-| `PINECONE_INDEX_NAME` | Yes | Target Pinecone index |
-| `MISTRAL_CHAT_MODEL` | Optional | Overrides the default chat model |
-
-## Running the Application
+## 9. Running the App
 
 ```powershell
 streamlit run app\streamlit_app.py
 ```
 
-<<<<<<< Updated upstream
-## How to Use
+## 10. How to Use
 
-### 1. Upload Past Exam Papers
-- Go to **Upload & Process → Past Exam Papers**
-- Enter any **subject name** (not limited to a fixed list)
-- Set the **exam year**
-- Upload one or more PDF exam papers
-- Click **Process Exam Papers**
+1. **Upload past exam papers** — *Upload & Process → Past Exam Papers*: enter a subject name and year, upload PDFs, click **Process**.
+2. **Upload subject reference material** *(optional, recommended)* — *Upload & Process → Subject PDFs*: syllabus/notes/textbooks, OCR-indexed as retrieval context.
+3. **Explore results**:
+   - **Topic Analysis** — discovered topics, filterable by subject
+   - **Question Predictions** — pick a subject + topic, choose a prompting strategy and difficulty, generate new questions
+   - **Similarity Search** — semantic search across the indexed corpus
+   - **Retrieval Evaluation** — live Precision@k / Recall@k / MRR / nDCG
+   - **Analytics Dashboard** — corpus-wide statistics and trends
 
-### 2. Upload Subject Reference PDFs (optional but recommended)
-- Go to **Upload & Process → Subject PDFs**
-- Enter the matching **subject name**
-- Upload syllabus, notes, or textbook PDFs
-- These are sent to OpenAI as context when generating questions
+**PDF tips:** use text-based PDFs where possible; numbered questions (`1.`, `Q1.`) parse most reliably; image-only PDFs are still supported via OCR but will be slower.
 
-### 3. Analyze & Generate
-- **Topic Analysis** — Discovered topics from your papers (filter by subject in sidebar)
-- **Question Predictions** — Select subject + discovered topic → OpenAI generates new questions
-- **Similarity Search** — Search your uploaded question bank
-- **Analytics Dashboard** — Stats across all uploaded subjects
+---
 
-##  API Key
+## Retrieval Evaluation Metrics (detail)
 
-Required for **Question Predictions**. Provide via:
-- `API_KEY` in `.env`
+<details>
+<summary>Expand for metric formulas, score interpretation bands, and improvement strategies</summary>
 
-## PDF Tips
+#### Precision@5
+`Precision@5 = (relevant results in top 5) / 5`
+Our result: **0.664** — roughly 3–4 of 5 retrieved chunks are relevant; Mistral's instruction-following tolerates the remaining noise reasonably well.
 
-- Use **text-based PDFs** (not scanned images)
-- Exam papers should have **numbered questions** (`1.`, `Q1.`, etc.)
-- Image-based PDFs show a friendly error message
+#### Recall@5
+`Recall@5 = (relevant results found in top 5) / (total relevant results in corpus)`
+Our result: **1.000** — every relevant past question/chunk is retrieved. This is the highest-priority metric for the project, since a missed relevant question means a pattern never reaches the generator.
 
-## Project Structure
-=======
-To sanity-check the environment before a full run:
->>>>>>> Stashed changes
+#### MRR (Mean Reciprocal Rank)
+`MRR = average(1 / rank of first relevant result)`
+Our result: **0.513** — the first relevant result appears around rank 2 on average; a stronger reranker signal would push this toward 1.0.
 
-```powershell
-python scripts\validate_project.py
-python scripts\check_mistral_key.py
-```
-<<<<<<< Updated upstream
-exam-pattern-analysis/
-├── data/raw/              # Uploaded PDFs saved here
-├── data/processed/        # questions.csv, subject_materials.csv
-├── app/streamlit_app.py   # Main dashboard
-├── src/                   # NLP, clustering, OpenAI generation
-└── scripts/               # Utility scripts
-```
+#### nDCG@5
+`nDCG@5 = DCG@5 / Ideal DCG@5`
+Our result: **0.731** — relevant content is generally ranked near the top, which matters because Mistral processes retrieved chunks in order.
 
-## Screenshots
+**Improvement strategies:** stricter similarity thresholds before reranking (Precision); domain-specific reranker fine-tuning (MRR); wider candidate pool before reranking, e.g. top-20 → top-5 (nDCG); current embedding/indexing already achieves ceiling performance on Recall.
 
+</details>
 
-## Team Members
-
-
-## License
-
-MIT License
-=======
-
-## User Guide
-
-The dashboard is organized into six pages, navigable from the sidebar:
-
-### 1. Upload & Process
-- **Past Exam Papers** — enter a subject name and exam year, then upload one or more PDF exam papers for OCR and question extraction.
-- **Subject PDFs** — enter a matching subject name and upload syllabus, notes, or textbook PDFs as retrieval context.
-- **Uploaded Data** — review what has already been ingested.
-
-### 2. Topic Analysis
-Displays topics discovered by clustering across uploaded papers, filterable by subject.
-
-### 3. Question Predictions
-Select a subject and a discovered topic; the system retrieves and reranks relevant historical evidence, then asks Mistral to generate new candidate questions with a chosen difficulty and generation strategy.
-
-### 4. Similarity Search
-Pinecone-backed semantic search across the indexed question bank and lecture material, plus cross-paper similar-question lookup.
-
-### 5. Retrieval Evaluation
-Runs the evaluation suite (Precision@k, Recall@k, MRR, nDCG@k) against the currently indexed corpus and lets the user adjust `k`.
-
-### 6. Analytics Dashboard
-Aggregate statistics across all uploaded subjects.
-
-The sidebar also provides **Refresh Analysis** (recompute topics/embeddings) and **Clear All Uploaded Data** (wipes both the Pinecone namespaces and the local processed CSVs).
-
-## Retrieval Evaluation Metrics
-
-The **Retrieval Evaluation** page measures the quality of the retrieval + reranking stage that feeds the question generator — i.e., how relevant and well-ordered the evidence given to Mistral actually is.
-
-| Metric | Question it answers | Formula |
-|---|---|---|
-| **Precision@k** | Of the top-k results, how many are relevant? | relevant in top-k ÷ k |
-| **Recall@k** | Of all relevant items, how many were found in the top-k? | relevant in top-k ÷ total relevant |
-| **MRR** | At what rank does the first relevant result typically appear? | mean of 1 ÷ rank of first relevant hit |
-| **nDCG@k** | Are the most relevant results ranked highest, not just present? | DCG@k ÷ Ideal DCG@k |
-
-**Illustrative run (k = 5), evaluated on the project's own uploaded corpus:**
-
-| Metric | Score | Interpretation |
-|---|---|---|
-| Precision@5 | 0.664 | ~3–4 of 5 retrieved chunks are on-topic |
-| Recall@5 | 1.000 | All relevant items in the sampled evaluation window were retrieved |
-| MRR | 0.513 | The first relevant result appears at roughly rank 2 on average |
-| nDCG@5 | 0.731 | Relevant content is generally ranked near the top |
-
-Exact scores will vary by corpus and are recomputed live from whatever data is currently indexed — the table above reflects one illustrative run, not a fixed benchmark.
+---
 
 ## Known Limitations
 
-- **OCR-dependent segmentation:** question extraction relies on numbered patterns (`1.`, `Q1.`, etc.). Exam papers that don't follow a numbered format may segment poorly, and the app surfaces the underlying error rather than a tailored message in that case.
-- **No fixed subject taxonomy:** because subjects and topics are fully dynamic, result quality on a new subject depends entirely on how much material has been uploaded for it.
-- **`langgraph` is not an enforced dependency:** see the architecture note above — the agent workflow currently executes as direct Python calls rather than through an actual LangGraph graph.
-- **Recall@k on a self-contained corpus:** the evaluation harness treats the retrieved candidate pool as the reference set for "total relevant items," rather than an independently labeled ground truth. This is a reasonable proxy for monitoring relative retrieval quality over time, but the resulting Recall@k figures should be read as an internal consistency check rather than an external benchmark.
+- Requires valid `MISTRAL_API_KEY` and `PINECONE_API_KEY` to run end-to-end; without them, OCR, retrieval, and generation are unavailable.
+- Topic labels are derived from TF-IDF keywords over clusters, so label quality depends on corpus size — very small uploads (a handful of questions) produce less meaningful clusters.
+- Scanned/image-only PDFs rely on Mistral OCR and take longer to process than text-based PDFs.
 
->>>>>>> Stashed changes
